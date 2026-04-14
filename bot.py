@@ -36,6 +36,31 @@ def init_db():
             UNIQUE(chat_id, word)
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS chat_settings (
+            chat_id INTEGER PRIMARY KEY,
+            quiet INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_quiet(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT quiet FROM chat_settings WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return bool(row[0]) if row else False
+
+def set_quiet(chat_id, value):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO chat_settings (chat_id, quiet) VALUES (?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET quiet=excluded.quiet",
+        (chat_id, 1 if value else 0)
+    )
     conn.commit()
     conn.close()
 
@@ -158,6 +183,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             skipped.append(phrase)
 
+    # В тихом режиме всё обработали и сохранили, но не отвечаем.
+    if get_quiet(chat_id):
+        return
+
     if new_words or corrections:
         lines = []
         if corrections:
@@ -205,6 +234,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = text[:4000] + "\n\n... (список обрезан)"
     await query.edit_message_text(text)
 
+async def quiet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    new_value = not get_quiet(chat_id)
+    set_quiet(chat_id, new_value)
+    if new_value:
+        await update.message.reply_text(
+            "🔕 Тихий режим включён.\n"
+            "Слова будут сохраняться и переводиться в фоне, без подтверждений.\n"
+            "Посмотреть словарик: /vocab\n"
+            "Выключить тихий режим: /quiet"
+        )
+    else:
+        await update.message.reply_text(
+            "🔔 Тихий режим выключен. Буду снова отвечать на каждое сообщение."
+        )
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я VocabBot.\n\n"
@@ -213,6 +258,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Можно несколько за раз — через запятую, точку с запятой или с новой строки.\n\n"
         "Команды:\n"
         "/vocab — показать словарик\n"
+        "/quiet — вкл/выкл тихий режим (работа в фоне без ответов)\n"
         "/start — эта справка"
     )
 
@@ -221,6 +267,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("vocab", vocab_command))
+    app.add_handler(CommandHandler("quiet", quiet_command))
     app.add_handler(CallbackQueryHandler(button_handler, pattern="^vocab_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("VocabBot started")
