@@ -1,25 +1,28 @@
 import os
 import re
+import json
 import sqlite3
 import logging
 from datetime import datetime, timedelta
 from anthropic import Anthropic
- 
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, MessageHandler, CommandHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
- 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
- 
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
- 
+
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 DB_PATH = "vocab.db"
- 
+
+MAX_WORDS_IN_PHRASE = 5
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -35,7 +38,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
- 
+
 def save_word(chat_id, word, translation):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -52,7 +55,7 @@ def save_word(chat_id, word, translation):
         inserted = False
     conn.close()
     return inserted
- 
+
 def get_words(chat_id, since):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -63,51 +66,111 @@ def get_words(chat_id, since):
     rows = c.fetchall()
     conn.close()
     return rows
- 
-def translate_word(word):
+
+def analyze_word(word):
+    """
+    Отправляет слово/фразу в Claude.
+    Возвращает dict: {"corrected": str, "translation": str}
+    - corrected: исправленный вариант (с учётом опечаток), в нижнем регистре
+    - translation: расширенный перевод с несколькими значениями
+    """
     try:
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=100,
+            max_tokens=400,
             messages=[{
                 "role": "user",
                 "content": (
-                    f"Переведи английское слово или фразу на русский язык. "
-                    f"Ответь ТОЛЬКО переводом, без пояснений и без кавычек.\n\n"
-                    f"Слово: {word}"
+                    "Ты — помощник для изучения английского языка. "
+                    "Пользователь прислал английское слово или короткую фразу (до 5 слов). "
+                    "Сделай две вещи:\n"
+                    "1) Исправь опечатки, если они есть. Верни корректное написание в нижнем регистре "
+                    "(имена собственные — с заглавной). Если ошибок нет — верни как есть.\n"
+                    "2) Дай расширенный перевод на русский с несколькими основными значениями, "
+                    "если они есть. Формат перевода: значения через запятую или точку с запятой "
+                    "для разных смыслов. Коротко, без примеров и без пояснений. "
+                    "Максимум 200 символов.\n\n"
+                    "Ответь СТРОГО в формате JSON без markdown и без пояснений:\n"
+                    '{"corrected": "...", "translation": "..."}\n\n'
+                    f"Ввод: {word}"
                 )
             }]
         )
-        return response.content[0].text.strip()
+        raw = response.content[0].text.strip()
+        # На случай, если модель обернула JSON в ```json ... ```
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+        corrected = str(data.get("corrected", word)).strip()
+        translation = str(data.get("translation", "—")).strip()
+        if not corrected:
+            corrected = word
+        if not translation:
+            translation = "—"
+        return {"corrected": corrected, "translation": translation}
     except Exception as e:
-        logger.error(f"translate_word error: {e}")
-        return "—"
- 
-def is_english_word(text):
+        logger.error(f"analyze_word error: {e}")
+        return {"corrected": word, "translation": "—"}
+
+def is_english_phrase(text):
+    """
+    Принимает английские слова и фразы до 5 слов.
+    Допускает буквы, дефис, апостроф и пробелы между словами.
+    """
     text = text.strip()
-    return bool(re.fullmatch(r"[a-zA-Z\-']{2,40}", text))
- 
+    if not text:
+        return False
+    if not re.fullmatch(r"[a-zA-Z\-' ]{2,60}", text):
+        return False
+    words = [w for w in text.split() if w]
+    if len(words) == 0 or len(words) > MAX_WORDS_IN_PHRASE:
+        return False
+    # каждая часть должна содержать хотя бы одну букву
+    for w in words:
+        if not re.search(r"[a-zA-Z]", w):
+            return False
+    return True
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.text:
         return
     text = msg.text.strip()
     chat_id = msg.chat_id
+    # Разделители между разными словами/фразами — запятая, точка с запятой, перевод строки.
+    # Пробел НЕ является разделителем, чтобы поддержать фразы типа "driving license".
     candidates = re.split(r"[,\n;]+", text)
     new_words = []
+    corrections = []  # (оригинал, исправленный) — показать пользователю
+    skipped = []
     for candidate in candidates:
-        word = candidate.strip()
-        if is_english_word(word):
-            translation = translate_word(word)
-            inserted = save_word(chat_id, word, translation)
+        phrase = candidate.strip()
+        if not phrase:
+            continue
+        if is_english_phrase(phrase):
+            result = analyze_word(phrase)
+            corrected = result["corrected"].strip()
+            translation = result["translation"]
+            inserted = save_word(chat_id, corrected, translation)
             if inserted:
-                new_words.append((word, translation))
-    if new_words:
-        lines = ["Добавлено в словарик:"]
-        for w, t in new_words:
-            lines.append(f"  {w} — {t}")
+                new_words.append((corrected, translation))
+            if corrected.lower() != phrase.lower():
+                corrections.append((phrase, corrected))
+        else:
+            skipped.append(phrase)
+
+    if new_words or corrections:
+        lines = []
+        if corrections:
+            lines.append("Исправлены опечатки:")
+            for orig, corr in corrections:
+                lines.append(f"  {orig} → {corr}")
+            lines.append("")
+        if new_words:
+            lines.append("Добавлено в словарик:")
+            for w, t in new_words:
+                lines.append(f"  {w} — {t}")
         await msg.reply_text("\n".join(lines))
- 
+
 async def vocab_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("За сегодня", callback_data="vocab_today")],
@@ -117,7 +180,7 @@ async def vocab_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("За какой период показать словарик?",
                                     reply_markup=InlineKeyboardMarkup(keyboard))
- 
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -141,16 +204,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(text) > 4000:
         text = text[:4000] + "\n\n... (список обрезан)"
     await query.edit_message_text(text)
- 
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я VocabBot.\n\n"
-        "Просто пиши английские слова в этот чат — я их переведу и сохраню.\n\n"
+        "Пиши английские слова или короткие фразы (до 5 слов) — "
+        "я исправлю опечатки, дам расширенный перевод и сохраню в словарик.\n\n"
+        "Можно несколько за раз — через запятую, точку с запятой или с новой строки.\n\n"
         "Команды:\n"
         "/vocab — показать словарик\n"
         "/start — эта справка"
     )
- 
+
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
@@ -160,6 +225,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("VocabBot started")
     app.run_polling()
- 
+
 if __name__ == "__main__":
     main()
